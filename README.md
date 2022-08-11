@@ -1,4 +1,5 @@
 # Panoptic Scene Graph Generation
+You can refer to `mask_roi` branch for using segmentation-based masked roi features on psg two-stage pipeline.
 <!-- <br /> -->
 <!-- <p align="center">
   <img src="https://live.staticflickr.com/65535/52193879677_751a4e0b79_k.jpg" align="center" width="60%"> -->
