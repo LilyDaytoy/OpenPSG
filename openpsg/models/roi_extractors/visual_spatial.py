@@ -47,6 +47,7 @@ class VisualSpatialExtractor(BaseModule):
             with_avg_pool=False,
             with_visual_bbox=True,
             with_visual_mask=False,
+            require_masked_feats=False,  # for using roi_forward_with_mask
             with_visual_point=False,
             with_spatial=False,
             separate_spatial=False,
@@ -67,6 +68,7 @@ class VisualSpatialExtractor(BaseModule):
         self.with_avg_pool = with_avg_pool
         self.with_visual_bbox = with_visual_bbox
         self.with_visual_mask = with_visual_mask
+        self.require_masked_feats = require_masked_feats
         self.with_visual_point = with_visual_point
         self.with_spatial = with_spatial
         self.separate_spatial = separate_spatial
@@ -240,6 +242,50 @@ class VisualSpatialExtractor(BaseModule):
         new_rois = torch.stack((rois[:, 0], x1, y1, x2, y2), dim=-1)
         return new_rois
 
+    def roi_forward_with_mask(self,
+                              roi_layers,
+                              feats,
+                              rois,  # [k,5] - rois here based on ori_shape ???
+                              masks,
+                              roi_scale_factor=None):
+        """Get concated roi_feats from both segmentation masks and bounding boxes.
+
+        Returns:
+            merged_roi_feats shape: [num_obj, 512, 7, 7] 
+            NOTE: need to change config 256 to 512, require_masked_feats = True in config file
+        """
+        assert masks is not None, "roi_forward_with_mask cannot proceed with None type masks!"
+        if len(feats) == 1:
+            roi_feats = roi_layers[0](feats[0], rois)
+            # TODO - no masked_feats implementation for len(feats)==1 so far
+        else:
+            out_size = roi_layers[0].output_size  # (7,7)
+            num_levels = self.num_inputs # 4
+            target_lvls = self.map_roi_levels(rois, num_levels)  #[k,] - map all rois to level 0,1,2,3 by scale
+            roi_feats = feats[0].new_zeros(rois.size(0), self.roi_out_channels, 
+                                           *out_size) # (k, 256, 7, 7)
+            mask_roi_feats = feats[0].new_zeros(rois.size(0), self.roi_out_channels,
+                                           *out_size) # for segmentation-masked feats
+            if roi_scale_factor is not None: # None
+                rois = self.roi_rescale(rois, roi_scale_factor)
+
+            # stack all masks (need modify) - make codes more suitable for other tasks
+            masks = torch.stack(masks, dim=0) # [total_num_obj_in_batch, unified_h, unified_w]
+            for i in range(num_levels):
+                inds = target_lvls == i  # all roi ids that map this level - also indicates ids of masks that map this feature map level
+                if inds.any():
+                    rois_ = rois[inds, :]  # get those rois
+                    roi_feats_t = roi_layers[i](feats[i], rois_) # input this level's feature (from FPN)
+                    roi_feats[inds] = roi_feats_t # [ki, 256, 7, 7]
+                    # get masked rois feats
+                    masks_ = masks[inds, :]  # get those masks that map the level
+                    masked_feats, rois_remap = self.get_masked_feats(masks_, rois_, feats[i])
+                    mask_roi_feats_t = roi_layers[i](masked_feats, rois_remap)
+                    mask_roi_feats[inds] = mask_roi_feats_t
+            # cat roi_feats and mask_roi_feats in channel dim
+            merged_roi_feats = torch.cat([roi_feats, mask_roi_feats], dim=1) 
+        return merged_roi_feats
+
     def roi_forward(self,
                     roi_layers,
                     feats,
@@ -288,8 +334,8 @@ class VisualSpatialExtractor(BaseModule):
         if self.with_visual_bbox:
             roi_feats_bbox = self.roi_forward(self.bbox_roi_layers, feats,
                                               rois, masks, roi_scale_factor)
-        if self.with_visual_mask:
-            roi_feats_mask = self.roi_forward(self.mask_roi_layers, feats,
+        if self.require_masked_feats:
+            roi_feats_bbox = self.roi_forward_with_mask(self.bbox_roi_layers, feats,
                                               rois, masks, roi_scale_factor)
         if self.with_visual_point:
             # input: (N_entity, Ndim(2), N_point)
