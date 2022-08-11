@@ -150,9 +150,10 @@ model = dict(
                                 sampling_ratio=2),
             with_visual_bbox=True,
             with_visual_mask=False,
+            require_masked_feats=True, # for using roi_forward_with_mask
             with_visual_point=False,
             with_spatial=False,
-            in_channels=256,
+            in_channels=512, # if require_masked_feats=True, need to set in_channels to 512 (256 box feats + 256 masked feats)
             fc_out_channels=1024,
             featmap_strides=[4, 8, 16, 32],
         ),
