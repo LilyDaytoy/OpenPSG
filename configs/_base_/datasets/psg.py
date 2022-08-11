@@ -58,7 +58,7 @@ test_pipeline = [
                 type='ToDataContainer',
                 fields=(dict(key='gt_bboxes'), dict(key='gt_labels')),
             ),
-            dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels']),
+            dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks_ori']),
         ],
     ),
 ]
