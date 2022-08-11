@@ -2,14 +2,18 @@ import mmcv
 import numpy as np
 import torch
 import torch.nn.functional as F
+
 from detectron2.utils.visualizer import VisImage, Visualizer
 from mmdet.core import BitmapMasks, bbox2roi, build_assigner, multiclass_nms
 from mmdet.datasets.coco_panoptic import INSTANCE_OFFSET
 from mmdet.models import DETECTORS, PanopticFPN
 from mmdet.models.builder import build_head
+from mmdet.datasets.pipelines.transforms import Pad, Resize
 
 from openpsg.models.relation_heads.approaches import Result
-from openpsg.utils.utils import adjust_text_color, draw_text, get_colormap
+from openpsg.utils import adjust_text_color, draw_text, get_colormap
+
+# from mmdet.models.losses.cross_entropy_loss import cross_entropy
 
 
 @DETECTORS.register_module()
@@ -63,6 +67,7 @@ class SceneGraphPanopticFPN(PanopticFPN):
                               rescale=False):
         """Test without Augmentation; convert panoptic segments to bounding
         boxes."""
+        # x = self.extract_feat(img)
 
         if proposals is None:
             proposal_list = self.rpn_head.simple_test_rpn(x, img_metas)
@@ -142,12 +147,61 @@ class SceneGraphPanopticFPN(PanopticFPN):
             labels = torch.tensor(labels).to(det_labels[0])
 
             result = dict(pan_results=pan_results,
-                          masks=segms,
                           bboxes=masks_to_bboxes,
-                          labels=labels)
+                          labels=labels,
+                          binary_masks=segms)  # also return binary_masks for each object
             results.append(result)
 
         return results
+
+    def unify_mask(self, masks, img_metas):
+        """Unify datatype and shape of masks got from predcls (gt_masks) and sgdet (det_segms).
+
+        Args:
+            masks (np.array or bitmapmask) a list of binary masks for all objects in the samples in a batch)
+            img_meta
+
+        Returns:
+            masks (tensor + pad shape + pad 0 to biggest img shape in the batch) [batch_size, max_h, max_w]
+        """
+        assert len(masks) > 0, "Masks should not be empty"
+        assert isinstance(masks[0], BitmapMasks) or isinstance(masks[0], np.ndarray), "Masks can only be  bimapmask or numpy array type"
+        if isinstance(masks[0], BitmapMasks): # from predcls -- already in pad shape
+            # Take the map array out from bitmapmask datatype
+            masks = [bitmap_mask.masks for bitmap_mask in masks]
+        else: # from sgdet
+            if masks[0].shape[1:] == img_metas[0]['ori_shape'][:2]:
+                # Follow the way img is preprocessed in shape - Change ori_shape of mask to pad shape
+                for idx in range(len(img_metas)):
+                    resize = img_metas[idx]['img_shape'][0:2]
+                    mask = masks[idx].astype(float) # shape - (num_objects, h, w)
+                    mask = mask.transpose(1,2,0) # change the num_objects to the last dim (mmcv.imread reads img in (H,W,C)), let C = num_objects
+                    #mask_resize = F.interpolate(mask, size=resize, mode='nearest')
+                    mask_resize = mmcv.imresize(mask, (resize[1],resize[0]), return_scale=False) # Note: shape - (w,h)
+                    #mask_pad = Pad(size_divisor=32)(mask_resize)
+                    mask_pad = mmcv.impad_to_multiple(mask_resize, divisor=32)
+                    if len(mask_pad.shape) == 2:
+                        mask_pad = np.expand_dims(mask_pad, axis=2)   # for samples only containing one object, expand dims
+                    masks[idx] = mask_pad.transpose(2,0,1) # reshape back
+            else:
+                assert masks[0].shape[1:] == img_metas[0]['pad_shape'][:2], "Input masks neither ori shape nor pad shape!"
+        
+        # Now we get all masks to pad shape, then unify mask shape for this batch to maximum size in the batch
+        # find max_h, max_w 
+        shapes = np.array([[mask.shape[1], mask.shape[2]] for mask in masks])
+        (max_h, max_w) = np.max(shapes, axis=0)
+        # unify all masks in the batch by padding zero
+        for idx in range(len(img_metas)): 
+            mask = masks[idx] # shape - (num_objects, h_pad, w_pad)
+            mask = mask.transpose(1,2,0)
+            mask = mmcv.impad(mask, shape=(max_h, max_w))  # Note: Expected padding shape (h, w) -- need modify (specify where to pad ?)
+            if len(mask.shape) == 2:
+                mask = np.expand_dims(mask, axis=2)
+            mask = mask.transpose(2,0,1)
+            masks[idx] = torch.FloatTensor(mask).cuda()  # convert to tensor and put on cuda0
+        return masks
+
+
 
     def forward_train(
         self,
@@ -192,9 +246,9 @@ class SceneGraphPanopticFPN(PanopticFPN):
                 labels,
                 target_labels,
                 dists,  # Can this be `None`?
-                pan_masks,
                 pan_results,
                 points,
+                binary_masks   # wx - return gt_masks (pred_cls - pad shape); binary_masks (sgdet - ori shape)
             ) = self.detector_simple_test(
                 x,
                 img_metas,
@@ -206,16 +260,16 @@ class SceneGraphPanopticFPN(PanopticFPN):
                 proposals,
                 use_gt_box=self.relation_head.use_gt_box,
                 use_gt_label=self.relation_head.use_gt_label,
-                rescale=rescale,
+                rescale=True,   #wx# temporal
             )
 
-            # Filter out empty predictions
+            # Filter out empty predictions  #wx# 考虑到一张图上没有object需要detect的情况
             idxes_to_filter = [i for i, b in enumerate(bboxes) if len(b) == 0]
 
             param_need_filter = [
-                bboxes, labels, dists, target_labels, gt_bboxes, gt_labels,
+                bboxes, labels, dists, target_labels, binary_masks, gt_bboxes, gt_labels,
                 gt_rels, img_metas, gt_scenes, gt_keyrels, points, pan_results,
-                gt_masks, gt_relmaps, pan_masks
+                gt_masks, gt_relmaps
             ]
             for idx, param in enumerate(param_need_filter):
                 if param_need_filter[idx]:
@@ -223,17 +277,16 @@ class SceneGraphPanopticFPN(PanopticFPN):
                         x for i, x in enumerate(param)
                         if i not in idxes_to_filter
                     ]
-
-            (bboxes, labels, dists, target_labels, gt_bboxes, gt_labels,
+            (bboxes, labels, dists, target_labels, binary_masks, gt_bboxes, gt_labels,
              gt_rels, img_metas, gt_scenes, gt_keyrels, points, pan_results,
-             gt_masks, gt_relmaps, pan_masks) = param_need_filter
+             gt_masks, gt_relmaps) = param_need_filter
             # Filter done
 
-            if idxes_to_filter and len(gt_bboxes) == 16:
+            if idxes_to_filter and len(gt_bboxes) == 2:
                 print('sg_panoptic_fpn: not filtered!')
 
             filtered_x = []
-            for idx in range(len(x)):
+            for idx in range(len(x)):  #wx# len(x) is the num_outputs from fpn
                 filtered_x.append(
                     torch.stack([
                         e for i, e in enumerate(x[idx])
@@ -241,6 +294,8 @@ class SceneGraphPanopticFPN(PanopticFPN):
                     ]))
             x = filtered_x
 
+            # Unify binary_masks shape and datatype
+            binary_masks = self.unify_mask(binary_masks, img_metas)
             gt_result = Result(
                 # bboxes=all_gt_bboxes,
                 # labels=all_gt_labels,
@@ -262,8 +317,8 @@ class SceneGraphPanopticFPN(PanopticFPN):
                 bboxes=bboxes,
                 labels=labels,
                 dists=dists,
-                masks=pan_masks,
-                pan_results=pan_results,
+                masks=binary_masks,
+                pan_results=pan_results,  # wx - change original "masks" param to "pan_results"
                 points=points,
                 target_labels=target_labels,
                 target_scenes=gt_scenes,
@@ -276,7 +331,7 @@ class SceneGraphPanopticFPN(PanopticFPN):
             # Loss performed here
             return self.relation_head.loss(det_result)
 
-    def forward_test(self, imgs, img_metas, **kwargs):
+    def forward_test(self, imgs, img_metas, gt_masks_ori, **kwargs):
         """
         Args:
             imgs (List[Tensor]): the outer list indicates test-time
@@ -310,6 +365,7 @@ class SceneGraphPanopticFPN(PanopticFPN):
         return self.relation_simple_test(imgs[0],
                                          img_metas[0],
                                          key_first=key_first,
+                                         gt_masks_ori=gt_masks_ori,
                                          **kwargs)
 
         # if num_augs == 1:
@@ -360,7 +416,6 @@ class SceneGraphPanopticFPN(PanopticFPN):
         """
         assert self.with_bbox, 'Bbox head must be implemented.'
 
-        pan_seg_masks = None
         if use_gt_box and use_gt_label:  # predcls
             # if is_testing:
             #     det_results = self.simple_test_sg_bboxes(x, img_meta,
@@ -368,8 +423,7 @@ class SceneGraphPanopticFPN(PanopticFPN):
             #     pan_results = [r['pan_results'] for r in det_results]
 
             target_labels = gt_labels
-            pan_seg_masks = gt_masks
-            return gt_bboxes, gt_labels, target_labels, None, gt_masks, None, None
+            return gt_bboxes, gt_labels, target_labels, None, None, None, gt_masks   # add return gt_masks here
 
         # NOTE: Sgcls should not be performed
         elif use_gt_box and not use_gt_label:  # sgcls
@@ -377,10 +431,19 @@ class SceneGraphPanopticFPN(PanopticFPN):
             target_labels = gt_labels
             _, det_labels, det_dists = self.detector_simple_test_det_bbox(
                 x, img_meta, proposals=gt_bboxes, rescale=rescale)
-            return gt_bboxes, det_labels, target_labels, det_dists, gt_masks, None, None
+            return gt_bboxes, det_labels, target_labels, det_dists, None, None, None
 
         elif not use_gt_box and not use_gt_label:  # sgdet
             """It returns 1-based det_labels."""
+            # (
+            #     det_bboxes,
+            #     det_labels,
+            #     det_dists,
+            #     _,
+            #     _,
+            # ) = self.detector_simple_test_det_bbox_mask(x,
+            # img_meta, rescale=rescale)
+
             # get target labels for the det bboxes: make use of the
             # bbox head assigner
             if not is_testing:  # excluding the testing phase
@@ -390,6 +453,7 @@ class SceneGraphPanopticFPN(PanopticFPN):
                 det_bboxes = [r['bboxes'] for r in det_results]
                 det_labels = [r['labels'] for r in det_results]  # 1-index
                 pan_results = None
+                det_binary_masks = [r['binary_masks'] for r in det_results]
 
                 target_labels = []
                 # MaxIOUAssigner
@@ -408,26 +472,14 @@ class SceneGraphPanopticFPN(PanopticFPN):
             else:
                 det_results = self.simple_test_sg_bboxes(x,
                                                          img_meta,
-                                                         rescale=rescale)
+                                                         rescale=True)   # hard code here wx temporal
                 det_bboxes = [r['bboxes'] for r in det_results]
                 det_labels = [r['labels'] for r in det_results]  # 1-index
-                pan_seg_masks = [r['masks'] for r in det_results]
 
-                # to reshape pan_seg_masks
-                mask_size = (img_meta[0]['ori_shape'][0],
-                             img_meta[0]['ori_shape'][1])
-                pan_seg_masks = F.interpolate(
-                    torch.Tensor(pan_seg_masks[0]).unsqueeze(1),
-                    size=mask_size).squeeze(1).bool()
-                pan_seg_masks = [pan_seg_masks.numpy()]
-
-                # TODO: why number of bboxes/masks will differ between 2 tests?
-
-                det_results_for_pan = self.simple_test_sg_bboxes(x,
-                                                                 img_meta,
-                                                                 rescale=True)
-                pan_results = [r['pan_results'] for r in det_results_for_pan]
-                # pan_seg_masks = [r['masks'] for r in det_results_for_pan]
+                # det_results = self.simple_test_sg_bboxes(x, img_meta,
+                # rescale=True)
+                pan_results = [r['pan_results'] for r in det_results]
+                det_binary_masks = [r['binary_masks'] for r in det_results]
 
                 target_labels = None
 
@@ -454,7 +506,7 @@ class SceneGraphPanopticFPN(PanopticFPN):
             # target_labels: List[B x (N_b)]
             # det_dists: List[B x (N_b, N_c + 1)]
             return det_bboxes, det_labels, target_labels, \
-                det_dists, pan_seg_masks, pan_results, None
+                det_dists, pan_results, None, det_binary_masks # wx - return binary segms as masks here first (need modify)
 
     def detector_simple_test_det_bbox(self,
                                       x,
@@ -565,6 +617,7 @@ class SceneGraphPanopticFPN(PanopticFPN):
         rescale=False,
         ignore_classes=None,
         key_first=False,
+        gt_masks_ori=None,
     ):
         """
         :param img:
@@ -592,9 +645,9 @@ class SceneGraphPanopticFPN(PanopticFPN):
             gt_bboxes = gt_bboxes[0]
         if gt_labels is not None:
             gt_labels = gt_labels[0]
-        if gt_masks is not None:
-            gt_masks = gt_masks[0]
-
+        if gt_masks_ori is not None:
+            # gt_masks = [gt_masks[0][0]] #wx - hard code here
+            gt_masks = [gt_masks_ori[0][0].cpu().numpy()] # array type masks in original shape - same as sgdet
         x = self.extract_feat(img)
         """
         NOTE: (for VG) When the gt masks is None, but the head needs mask,
@@ -606,10 +659,19 @@ class SceneGraphPanopticFPN(PanopticFPN):
 
         # Rescale should be forbidden here since the bboxes and masks will
         # be used in relation module.
-        bboxes, labels, target_labels, dists, pan_masks, pan_results, points \
-            = self.detector_simple_test(
+        (
+            bboxes,
+            labels,
+            target_labels,
+            dists,  # Can this be `None`?
+            pan_results,
+            points,
+            binary_masks,   # wx - return gt_masks (pred_cls - pad shape); binary_masks (sgdet - ori shape)
+            ) = self.detector_simple_test(
             x,
             img_meta,
+            # all_gt_bboxes,
+            # all_gt_labels,
             gt_bboxes,
             gt_labels,
             gt_masks,
@@ -623,12 +685,14 @@ class SceneGraphPanopticFPN(PanopticFPN):
         #     self.saliency_detector_test(img, img_meta) if \
         #     self.with_saliency else None
         # )
+        # Unify binary_masks shape and datatype
+        binary_masks = self.unify_mask(binary_masks, img_meta)
 
         det_result = Result(
             bboxes=bboxes,
             labels=labels,
             dists=dists,
-            masks=pan_masks,
+            masks=binary_masks,
             pan_results=pan_results,
             points=points,
             target_labels=target_labels,
@@ -650,15 +714,10 @@ class SceneGraphPanopticFPN(PanopticFPN):
         (for visual, do not rescale, for evaluation, rescale).
         """
         scale_factor = img_meta[0]['scale_factor']
-        det_result = self.relation_head.get_result(det_result,
-                                                   scale_factor,
-                                                   rescale=rescale,
-                                                   key_first=key_first)
-
-        if pan_masks is not None:
-            det_result.masks = np.array(pan_masks[0])
-
-        return det_result
+        return self.relation_head.get_result(det_result,
+                                             scale_factor,
+                                             rescale=rescale,
+                                             key_first=key_first)
 
     def show_result(
         self,
