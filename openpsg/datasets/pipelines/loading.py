@@ -150,6 +150,7 @@ class LoadPanopticSceneGraphAnnotations(LoadPanopticAnnotations):
             # print('origin_size')
             # print(gt_masks)
             results['gt_masks'] = gt_masks
+            results['gt_masks_ori'] = gt_masks.masks  # get masks with ori_shape, no mmdet resize & pad
             results['mask_fields'].append('gt_masks')
 
         if self.with_seg:
